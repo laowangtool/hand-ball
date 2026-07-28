@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>手势骨骼标注</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #000;
+            overflow: hidden;
+            height: 100dvh;
+            width: 100vw;
+            font-family: monospace;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        /* 第 1 层：摄像头 */
+        #video-el {
+            position: fixed;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            /* transform 由 JS 动态控制：前置镜像，后置不镜像 */
+            z-index: 1;
+        }
+        #video-el.mirror {
+            transform: scaleX(-1);
+        }
+
+        /* 第 2 层：骨骼标注 */
+        #sk-canvas {
+            position: fixed;
+            inset: 0;
+            z-index: 2;
+            pointer-events: none;
+        }
+
+        /* 诊断面板 */
+        #log {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 10;
+            background: rgba(0,0,0,0.78);
+            color: #0f0;
+            font-size: 10px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid #333;
+            line-height: 1.5;
+            pointer-events: none;
+            max-width: 280px;
+            white-space: pre-wrap;
+            font-family: 'SF Mono','Cascadia Code',Consolas,monospace;
+        }
+
+        /* 翻转按钮 */
+        #btn-flip {
+            position: fixed;
+            bottom: 28px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            padding: 12px 24px;
+            border-radius: 14px;
+            border: 1px solid rgba(255,255,255,0.25);
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            color: #fff;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            letter-spacing: 0.03em;
+            transition: all 0.2s;
+            font-family: 'PingFang SC','Microsoft YaHei',sans-serif;
+        }
+        #btn-flip:active {
+            transform: translateX(-50%) scale(0.94);
+        }
+        #btn-flip:hover {
+            background: rgba(255,255,255,0.12);
+        }
+    </style>
+</head>
+<body>
+
+    <video id="video-el" playsinline autoplay muted></video>
+    <canvas id="sk-canvas"></canvas>
+    <div id="log"></div>
+    <button id="btn-flip">🔄 翻转摄像头</button>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"
+            crossorigin="anonymous"></script>
+
+    <script>
+    (function() {
+        const videoEl   = document.getElementById('video-el');
+        const skCanvas  = document.getElementById('sk-canvas');
+        const skCtx     = skCanvas.getContext('2d');
+        const logEl     = document.getElementById('log');
+        const btnFlip   = document.getElementById('btn-flip');
+
+        let hands       = null;
+        let rafId       = null;
+        let sending     = false;
+        let results     = null;
+        let cbCount     = 0;
+        let sendCount   = 0;
+        let errMsg      = '';
+        let currentStream = null;
+        let facingMode  = 'user';  // 'user' = 前置, 'environment' = 后置
+        // 前置摄像头需要镜像（镜子效果），后置不需要
+        let mirrorNeeded = true;   // facingMode === 'user' 时为 true
+
+        // 离屏 canvas（中转视频帧 → MediaPipe，修复 iOS Safari）
+        const offCanvas = document.createElement('canvas');
+        const offCtx    = offCanvas.getContext('2d', { willReadFrequently: true });
+        offCanvas.width  = 640;
+        offCanvas.height = 480;
+
+        function log(msg) {
+            logEl.textContent = msg;
+            console.log(msg);
+        }
+
+        // ============ 画布尺寸 ============
+        function resize() {
+            skCanvas.width  = window.innerWidth;
+            skCanvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // ============ 骨骼连线 ============
+        const CONNS = [
+            [0,1],[1,2],[2,3],[3,4],
+            [0,5],[5,6],[6,7],[7,8],
+            [0,9],[9,10],[10,11],[11,12],
+            [0,13],[13,14],[14,15],[15,16],
+            [0,17],[17,18],[18,19],[19,20],
+            [5,9],[9,13],[13,17]
+        ];
+
+        function drawSkeleton(lmList) {
+            skCtx.clearRect(0, 0, skCanvas.width, skCanvas.height);
+            if (!lmList || lmList.length === 0) return;
+            const w = skCanvas.width, h = skCanvas.height;
+
+            for (const lm of lmList) {
+                // ── 连线 ──
+                skCtx.strokeStyle = '#4cf';
+                skCtx.lineWidth = 2.5;
+                skCtx.lineCap = 'round';
+                skCtx.beginPath();
+                for (const [a,b] of CONNS) {
+                    // ★ 镜像逻辑：前置摄像头 x 坐标翻转
+                    const ax = mirrorNeeded ? (1 - lm[a].x) * w : lm[a].x * w;
+                    const ay = lm[a].y * h;
+                    const bx = mirrorNeeded ? (1 - lm[b].x) * w : lm[b].x * w;
+                    const by = lm[b].y * h;
+                    skCtx.moveTo(ax, ay);
+                    skCtx.lineTo(bx, by);
+                }
+                skCtx.stroke();
+
+                // ── 关节点 ──
+                for (let i = 0; i < lm.length; i++) {
+                    const p = lm[i];
+                    const sx = mirrorNeeded ? (1 - p.x) * w : p.x * w;
+                    const sy = p.y * h;
+                    const isKey = (i === 4 || i === 8);       // 拇指尖、食指尖
+                    const isTip = (i === 12 || i === 16 || i === 20);
+                    const r = isKey ? 6 : isTip ? 4 : 2.5;
+                    skCtx.beginPath();
+                    skCtx.arc(sx, sy, r, 0, Math.PI*2);
+                    skCtx.fillStyle = isKey ? '#ff0' : isTip ? '#f6a' : '#fff';
+                    skCtx.fill();
+                }
+            }
+        }
+
+        // ============ 初始化 MediaPipe ============
+        async function initHands() {
+            if (hands) return hands;
+            log('初始化 MediaPipe...');
+
+            const H = window.Hands;
+            if (!H) throw new Error('window.Hands 不存在，脚本加载失败');
+
+            hands = new H({
+                locateFile: (file) =>
+                    `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+            });
+
+            hands.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.3,
+            });
+
+            hands.onResults((r) => {
+                results = r;
+                cbCount++;
+                const lm = r.multiHandLandmarks;
+                if (lm && lm.length > 0) {
+                    drawSkeleton(lm);
+                } else {
+                    skCtx.clearRect(0, 0, skCanvas.width, skCanvas.height);
+                }
+            });
+
+            log('加载 WASM...');
+            await hands.initialize();
+            log('模型就绪 ✓');
+            return hands;
+        }
+
+        // ============ 启动摄像头 ============
+        async function startCamera() {
+            // 先停掉旧的
+            stopTracks();
+
+            try {
+                log(`请求摄像头 (${facingMode})...`);
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: facingMode,
+                        width: 640,
+                        height: 480,
+                    }
+                });
+                currentStream = stream;
+                videoEl.srcObject = stream;
+
+                // ★ 前置镜像，后置不镜像
+                if (facingMode === 'user') {
+                    videoEl.classList.add('mirror');
+                    mirrorNeeded = true;
+                } else {
+                    videoEl.classList.remove('mirror');
+                    mirrorNeeded = false;
+                }
+
+                await videoEl.play();
+
+                if (videoEl.readyState < 2) {
+                    log('等待视频数据...');
+                    await new Promise((res, rej) => {
+                        const t = setTimeout(() => rej(new Error('视频超时')), 8000);
+                        videoEl.onloadeddata = () => { clearTimeout(t); res(); };
+                    });
+                }
+
+                log(`视频就绪: ${videoEl.videoWidth}x${videoEl.videoHeight} | ${facingMode === 'user' ? '前置(镜像)' : '后置(原始)'}`);
+
+                await initHands();
+
+                // 帧循环
+                log('运行中...');
+                function frame() {
+                    if (sending) { rafId = requestAnimationFrame(frame); return; }
+                    sending = true;
+                    try {
+                        if (videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
+                            offCtx.drawImage(videoEl, 0, 0, offCanvas.width, offCanvas.height);
+                            hands.send({ image: offCanvas }).then(() => {
+                                sendCount++;
+                                sending = false;
+                            }).catch(e => {
+                                errMsg = e.message;
+                                sending = false;
+                            });
+                        } else {
+                            sending = false;
+                        }
+                    } catch(e) {
+                        errMsg = e.message;
+                        sending = false;
+                    }
+                    rafId = requestAnimationFrame(frame);
+                }
+                frame();
+
+            } catch(e) {
+                log(`❌ ${e.name}: ${e.message}`);
+                console.error(e);
+            }
+        }
+
+        function stopTracks() {
+            if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+            if (currentStream) {
+                currentStream.getTracks().forEach(t => t.stop());
+                currentStream = null;
+            }
+            videoEl.srcObject = null;
+            sending = false;
+        }
+
+        // ============ 翻转摄像头 ============
+        async function flipCamera() {
+            // 切换 facingMode
+            facingMode = (facingMode === 'user') ? 'environment' : 'user';
+            btnFlip.textContent = '⏳ 切换中...';
+            btnFlip.disabled = true;
+
+            // 重置计数
+            sendCount = 0;
+            cbCount = 0;
+            results = null;
+
+            await startCamera();
+
+            btnFlip.textContent = '🔄 翻转摄像头';
+            btnFlip.disabled = false;
+        }
+
+        btnFlip.addEventListener('click', flipCamera);
+
+        // ============ 每秒诊断 ============
+        setInterval(() => {
+            const hasHands = results?.multiHandLandmarks?.length > 0;
+            const handCount = hasHands ? results.multiHandLandmarks.length : 0;
+            let d = '';
+            if (hasHands) {
+                const t = results.multiHandLandmarks[0][4];
+                const i = results.multiHandLandmarks[0][8];
+                const dist = Math.hypot(t.x-i.x, t.y-i.y, t.z-i.z);
+                d = ` dist:${dist.toFixed(3)}`;
+            }
+            log(
+                `📷 ${facingMode==='user'?'前置':'后置'}  send:${sendCount} cb:${cbCount} ✋:${handCount}${d}` +
+                (errMsg ? `\n❌ ${errMsg}` : '')
+            );
+        }, 1000);
+
+        // ============ 启动 ============
+        startCamera();
+    })();
+    </script>
+</body>
+</html>
