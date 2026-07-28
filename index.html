@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>捏合拖动图标</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box;}
+        body{
+            background:#000;overflow:hidden;
+            height:100dvh;width:100vw;
+            font-family:'PingFang SC','Microsoft YaHei',sans-serif;
+            user-select:none;-webkit-user-select:none;
+            -webkit-tap-highlight-color:transparent;
+            touch-action:manipulation;
+        }
+
+        #cam-video{
+            position:fixed;inset:0;width:100%;height:100%;
+            object-fit:cover;z-index:1;
+        }
+
+        #icons-layer{
+            position:fixed;inset:0;z-index:2;
+            pointer-events:none;
+        }
+        .icon-item{
+            position:absolute;
+            font-size:44px;
+            transition:none;
+            will-change:transform;
+            line-height:1;
+            filter:drop-shadow(0 0 10px rgba(255,255,255,0.6))
+                   drop-shadow(0 2px 4px rgba(0,0,0,0.4));
+        }
+        .icon-item.grabbed{
+            filter:drop-shadow(0 0 24px rgba(255,255,100,1))
+                   drop-shadow(0 0 48px rgba(255,200,0,0.7))
+                   drop-shadow(0 4px 8px rgba(0,0,0,0.5));
+            z-index:999;
+        }
+        @media(min-width:640px){.icon-item{font-size:56px;}}
+
+        #sk-canvas{
+            position:fixed;inset:0;z-index:10;
+            pointer-events:none;
+        }
+
+        #hint{
+            position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+            z-index:20;padding:12px 24px;border-radius:22px;
+            background:rgba(0,0,0,0.8);color:#ffd000;
+            font-size:15px;pointer-events:none;
+            opacity:0;transition:opacity 0.3s;
+            letter-spacing:0.03em;text-align:center;
+            border:1.5px solid rgba(255,208,0,0.3);
+        }
+        #hint.show{opacity:1;}
+
+        .btn-bar{
+            position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+            z-index:30;display:flex;gap:10px;
+        }
+        .btn{
+            padding:10px 18px;border-radius:22px;
+            border:1px solid rgba(255,255,255,0.25);
+            background:rgba(0,0,0,0.65);
+            backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+            color:#fff;font-size:13px;cursor:pointer;
+            font-weight:500;letter-spacing:0.02em;
+            transition:all 0.2s;
+        }
+        .btn:active{transform:scale(0.93);}
+        .btn.on{
+            border-color:#22c55e;
+            box-shadow:0 0 14px rgba(34,197,94,0.35);
+        }
+
+        #diag{
+            position:fixed;top:8px;left:8px;z-index:30;
+            background:rgba(0,0,0,0.7);color:#0f0;
+            font-size:10px;padding:4px 8px;border-radius:5px;
+            border:1px solid #333;line-height:1.5;
+            pointer-events:none;font-family:monospace;
+        }
+    </style>
+</head>
+<body>
+
+    <video id="cam-video" playsinline autoplay muted></video>
+    <div id="icons-layer"></div>
+    <canvas id="sk-canvas"></canvas>
+
+    <div id="hint">👌 拇指食指捏合抓取 · 松开放下</div>
+    <div id="diag"></div>
+
+    <div class="btn-bar">
+        <button class="btn on" id="btn-front">📱 前置</button>
+        <button class="btn" id="btn-back">📷 后置</button>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+    (function(){
+        const videoEl   = document.getElementById('cam-video');
+        const iconsLayer= document.getElementById('icons-layer');
+        const skCanvas  = document.getElementById('sk-canvas');
+        const skCtx     = skCanvas.getContext('2d');
+        const hintEl    = document.getElementById('hint');
+        const diagEl    = document.getElementById('diag');
+        const btnFront  = document.getElementById('btn-front');
+        const btnBack   = document.getElementById('btn-back');
+
+        // ===== 状态 =====
+        let hands=null, rafId=null, stream=null;
+        let sendCount=0, sending=false;
+        let latestLM=null;
+        let facingMode='user';
+
+        // 捏合相关
+        let isPinching=false;         // 当前帧是否捏合
+        let wasPinching=false;        // 上一帧是否捏合
+        let pinchMid=null;            // 拇指+食指中点屏幕坐标 {x,y}
+        let prevPinchMid=null;        // 上一帧中点（算速度）
+        let pinchVel={x:0,y:0};       // 捏合点速度
+        let pinchDist=0;              // 拇指-食指距离（调试）
+        let handSeen=false;
+
+        let grabbedIcon=null;         // 当前被抓的图标
+
+        const GRAB_RADIUS=80;         // 捏合点离图标多近算抓住
+        const PINCH_THRESHOLD=0.065;  // 小于此距离 = 捏合
+
+        const offC=document.createElement('canvas');
+        offC.width=640;offC.height=480;
+        const offCtx=offC.getContext('2d',{willReadFrequently:true});
+
+        function diag(msg){diagEl.textContent=msg;}
+
+        // ===== 图标系统 =====
+        const emojis=['⭐','🟢','🔵','🟣','💎','🔥','🌟','✨','🦋','🌸','🍀','💫','🎯','🔮','🫧'];
+        const icons=[];
+        const ICON_COUNT=8;
+
+        class IconObj{
+            constructor(emoji){
+                this.el=document.createElement('div');
+                this.el.className='icon-item';
+                this.el.textContent=emoji;
+                iconsLayer.appendChild(this.el);
+
+                this.x=Math.random()*(window.innerWidth-80)+40;
+                this.y=Math.random()*(window.innerHeight-120)+60;
+                this.vx=0;this.vy=0;
+                this.baseSize=32+Math.random()*22;
+                this.el.style.fontSize=this.baseSize+'px';
+                this.grabbed=false;
+                this.updateDOM();
+            }
+
+            updateDOM(){
+                const s=this.grabbed?this.baseSize*1.25:this.baseSize;
+                this.el.style.fontSize=s+'px';
+                this.el.style.transform=`translate(${this.x}px,${this.y}px)`;
+                this.el.classList.toggle('grabbed',this.grabbed);
+            }
+
+            resetHome(){
+                this.x=Math.random()*(window.innerWidth-80)+40;
+                this.y=Math.random()*(window.innerHeight-120)+60;
+                this.vx=0;this.vy=0;
+            }
+        }
+
+        function spawnIcons(){
+            iconsLayer.innerHTML='';
+            icons.length=0;
+            grabbedIcon=null;
+            const shuffled=[...emojis].sort(()=>Math.random()-0.5);
+            for(let i=0;i<ICON_COUNT;i++){
+                icons.push(new IconObj(shuffled[i%shuffled.length]));
+            }
+        }
+
+        // ===== 骨骼绘制 =====
+        const CONNS=[
+            [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+            [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+            [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]
+        ];
+
+        function drawBones(lmList){
+            skCanvas.width=window.innerWidth;
+            skCanvas.height=window.innerHeight;
+            skCtx.clearRect(0,0,skCanvas.width,skCanvas.height);
+            if(!lmList||lmList.length===0)return;
+
+            const W=skCanvas.width,H=skCanvas.height;
+            const mirror=facingMode==='user';
+
+            for(const lm of lmList){
+                // 连线
+                skCtx.strokeStyle='#0ff';skCtx.lineWidth=4;
+                skCtx.lineCap='round';skCtx.lineJoin='round';
+                skCtx.shadowColor='rgba(0,255,255,0.6)';skCtx.shadowBlur=6;
+                skCtx.beginPath();
+                for(const[a,b] of CONNS){
+                    const ax=mirror?(1-lm[a].x)*W:lm[a].x*W;
+                    const ay=lm[a].y*H;
+                    const bx=mirror?(1-lm[b].x)*W:lm[b].x*W;
+                    const by=lm[b].y*H;
+                    skCtx.moveTo(ax,ay);skCtx.lineTo(bx,by);
+                }
+                skCtx.stroke();skCtx.shadowBlur=0;
+
+                // 关节点
+                for(let i=0;i<lm.length;i++){
+                    const p=lm[i];
+                    const sx=mirror?(1-p.x)*W:p.x*W;
+                    const sy=p.y*H;
+                    const isThumb=(i===4),isIndex=(i===8);
+                    const isTip=(i===12||i===16||i===20);
+                    const r=(isThumb||isIndex)?9:(isTip)?5:3;
+
+                    skCtx.beginPath();skCtx.arc(sx,sy,r+4,0,Math.PI*2);
+                    skCtx.fillStyle='rgba(255,255,0,0.25)';skCtx.fill();
+                    skCtx.beginPath();skCtx.arc(sx,sy,r,0,Math.PI*2);
+                    skCtx.fillStyle=(isThumb||isIndex)?'#ff0':(isTip)?'#f6a':'#fff';
+                    skCtx.fill();
+                }
+
+                // 拇指-食指连线 + 捏合状态
+                const t=lm[4],idx=lm[8];
+                const tx=mirror?(1-t.x)*W:t.x*W,ty=t.y*H;
+                const ix=mirror?(1-idx.x)*W:idx.x*W,iy=idx.y*H;
+                const dist=Math.hypot(t.x-idx.x,t.y-idx.y,t.z-idx.z);
+
+                skCtx.strokeStyle=dist<PINCH_THRESHOLD?'rgba(255,208,0,0.9)':'rgba(255,208,0,0.3)';
+                skCtx.lineWidth=dist<PINCH_THRESHOLD?3:1.5;
+                skCtx.setLineDash([5,4]);
+                skCtx.beginPath();skCtx.moveTo(tx,ty);skCtx.lineTo(ix,iy);skCtx.stroke();
+                skCtx.setLineDash([]);
+
+                // 中点（捏合时高亮）
+                const mx=(tx+ix)/2,my=(ty+iy)/2;
+                if(dist<PINCH_THRESHOLD){
+                    skCtx.beginPath();skCtx.arc(mx,my,10,0,Math.PI*2);
+                    skCtx.fillStyle='rgba(255,255,0,0.6)';
+                    skCtx.shadowColor='rgba(255,255,0,0.9)';
+                    skCtx.shadowBlur=16;
+                    skCtx.fill();skCtx.shadowBlur=0;
+                }else{
+                    skCtx.beginPath();skCtx.arc(mx,my,4,0,Math.PI*2);
+                    skCtx.fillStyle='rgba(255,255,255,0.4)';
+                    skCtx.fill();
+                }
+            }
+        }
+
+        // ===== MediaPipe =====
+        async function initHands(){
+            if(hands)return hands;
+            const H=window.Hands;
+            if(!H){console.error('window.Hands 不存在');return null;}
+            hands=new H({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${f}`});
+            hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.5,minTrackingConfidence:0.3});
+            hands.onResults(r=>{
+                const lm=r.multiHandLandmarks;
+                if(lm&&lm.length>0){
+                    latestLM=lm;
+                    handSeen=true;
+                    drawBones(lm);
+
+                    const mirror=facingMode==='user';
+                    const thumb=lm[0][4],index=lm[0][8];
+                    const dist=Math.hypot(thumb.x-index.x,thumb.y-index.y,thumb.z-index.z);
+                    pinchDist=dist;
+
+                    // 捏合判断
+                    wasPinching=isPinching;
+                    isPinching=(dist<PINCH_THRESHOLD);
+
+                    // 计算捏合中点屏幕坐标
+                    const midX=mirror?(1-(thumb.x+index.x)/2)*window.innerWidth:((thumb.x+index.x)/2)*window.innerWidth;
+                    const midY=((thumb.y+index.y)/2)*window.innerHeight;
+                    prevPinchMid=pinchMid;
+                    pinchMid={x:midX,y:midY};
+                }else{
+                    latestLM=null;
+                    handSeen=false;
+                    wasPinching=isPinching;
+                    isPinching=false;
+                    prevPinchMid=pinchMid;
+                    pinchMid=null;
+                    skCtx.clearRect(0,0,skCanvas.width,skCanvas.height);
+                }
+            });
+            await hands.initialize();
+            return hands;
+        }
+
+        // ===== 摄像头 =====
+        async function startCam(){
+            if(stream){stopCam();await sleep(300);}
+            try{
+                stream=await navigator.mediaDevices.getUserMedia({video:{facingMode,width:640,height:480}});
+                videoEl.srcObject=stream;
+                videoEl.style.transform=facingMode==='user'?'scaleX(-1)':'none';
+                await videoEl.play();
+                if(videoEl.readyState<2){
+                    await new Promise((res,rej)=>{
+                        const t=setTimeout(()=>rej(new Error('视频超时')),8000);
+                        videoEl.onloadeddata=()=>{clearTimeout(t);res();};
+                    });
+                }
+                const h=await initHands();
+                if(!h){return;}
+                async function frame(){
+                    rafId=requestAnimationFrame(frame);
+                    if(sending)return;sending=true;
+                    try{if(videoEl.readyState>=2&&videoEl.videoWidth>0){offCtx.drawImage(videoEl,0,0,640,480);await h.send({image:offC});sendCount++;}}catch(e){}
+                    sending=false;
+                }
+                frame();
+                btnFront.className='btn'+(facingMode==='user'?' on':'');
+                btnBack.className='btn'+(facingMode==='environment'?' on':'');
+            }catch(e){console.error(e);}
+        }
+
+        function stopCam(){
+            if(rafId){cancelAnimationFrame(rafId);rafId=null;}
+            if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+            videoEl.srcObject=null;
+            latestLM=null;handSeen=false;
+            isPinching=false;wasPinching=false;pinchMid=null;prevPinchMid=null;
+            if(grabbedIcon){
+                grabbedIcon.grabbed=false;
+                grabbedIcon.updateDOM();
+                grabbedIcon=null;
+            }
+            skCtx.clearRect(0,0,skCanvas.width,skCanvas.height);
+        }
+
+        async function switchCam(mode){
+            if(facingMode===mode)return;
+            facingMode=mode;
+            stopCam();
+            await sleep(300);
+            await startCam();
+        }
+
+        function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+        btnFront.addEventListener('click',()=>switchCam('user'));
+        btnBack.addEventListener('click',()=>switchCam('environment'));
+
+        // ===== 图标物理引擎 =====
+        function updateIcons(dt){
+            const dtC=Math.min(dt,0.05);
+
+            // 捏合点速度
+            if(pinchMid&&prevPinchMid){
+                pinchVel={
+                    x:(pinchMid.x-prevPinchMid.x)/Math.max(dt,0.001),
+                    y:(pinchMid.y-prevPinchMid.y)/Math.max(dt,0.001)
+                };
+            }else{
+                pinchVel={x:0,y:0};
+            }
+
+            const pm=pinchMid;
+
+            // ── 抓取逻辑 ──
+            if(isPinching&&pm){
+                // 正在捏合
+                if(grabbedIcon){
+                    // 已抓住 → 跟随捏合点
+                    grabbedIcon.x=pm.x;
+                    grabbedIcon.y=pm.y;
+                    grabbedIcon.vx=pinchVel.x;
+                    grabbedIcon.vy=pinchVel.y;
+                    grabbedIcon.updateDOM();
+                }else{
+                    // 还没抓住 → 尝试抓最近的图标
+                    let best=null,bestDist=GRAB_RADIUS;
+                    for(const icon of icons){
+                        const dx=icon.x-pm.x;
+                        const dy=icon.y-pm.y;
+                        const dist=Math.sqrt(dx*dx+dy*dy);
+                        if(dist<bestDist){bestDist=dist;best=icon;}
+                    }
+                    if(best){
+                        best.grabbed=true;
+                        best.vx=0;best.vy=0;
+                        best.updateDOM();
+                        grabbedIcon=best;
+                        hintEl.classList.add('show');
+                        clearTimeout(hintEl._t);
+                        hintEl._t=setTimeout(()=>hintEl.classList.remove('show'),1200);
+                    }
+                }
+            }else{
+                // 没在捏合
+                if(grabbedIcon){
+                    // 刚松开 → 图标留在当前位置（继承捏合点速度）
+                    grabbedIcon.vx=pinchVel.x;
+                    grabbedIcon.vy=pinchVel.y;
+                    grabbedIcon.grabbed=false;
+                    grabbedIcon.updateDOM();
+                    grabbedIcon=null;
+                }
+            }
+
+            // ── 自由图标物理（没被抓住的）──
+            for(const icon of icons){
+                if(icon.grabbed)continue;
+
+                // 没有弹簧回归！图标停在原地
+                // 只有极小的摩擦力和边界约束
+
+                const speed=Math.sqrt(icon.vx*icon.vx+icon.vy*icon.vy);
+
+                // 多级阻尼
+                let damp;
+                if(speed>600) damp=0.97;       // 高速滑行
+                else if(speed>100) damp=0.93;   // 中速
+                else if(speed>10) damp=0.88;    // 慢速
+                else damp=0.70;                  // 极慢：快速停下
+
+                icon.vx*=damp;
+                icon.vy*=damp;
+
+                // 速度太小时直接停
+                if(Math.abs(icon.vx)<0.5&&Math.abs(icon.vy)<0.5){
+                    icon.vx=0;icon.vy=0;
+                }
+
+                icon.x+=icon.vx*dtC;
+                icon.y+=icon.vy*dtC;
+
+                // 边界弹性
+                const m=20,bounce=0.45;
+                if(icon.x<m){icon.x=m;icon.vx=Math.abs(icon.vx)*bounce;}
+                if(icon.x>window.innerWidth-m){icon.x=window.innerWidth-m;icon.vx=-Math.abs(icon.vx)*bounce;}
+                if(icon.y<m){icon.y=m;icon.vy=Math.abs(icon.vy)*bounce;}
+                if(icon.y>window.innerHeight-m){icon.y=window.innerHeight-m;icon.vy=-Math.abs(icon.vy)*bounce;}
+
+                icon.updateDOM();
+            }
+
+            // 每秒诊断
+            if(Math.floor(performance.now()/1000)!==Math.floor((performance.now()-dt*1000)/1000)){
+                const g=grabbedIcon?'抓住':'无';
+                diag(`捏合:${isPinching?'✅':'❌'} 距:${pinchDist.toFixed(3)} ${g}`);
+            }
+        }
+
+        // ===== 动画循环 =====
+        let lastTime=performance.now();
+        function animate(now){
+            requestAnimationFrame(animate);
+            const dt=(now-lastTime)/1000;
+            lastTime=now;
+            updateIcons(dt);
+        }
+
+        // ===== 启动 =====
+        spawnIcons();
+        startCam();
+        requestAnimationFrame(animate);
+
+        // 初始提示
+        hintEl.classList.add('show');
+        setTimeout(()=>hintEl.classList.remove('show'),3000);
+
+        window.addEventListener('resize',()=>{
+            for(const icon of icons) icon.resetHome();
+        });
+    })();
+    </script>
+</body>
+</html>
