@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>3D 粒子系统 - 手势控制</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --panel-bg: rgba(15, 15, 25, 0.88);
+            --accent: #6366f1;
+            --accent-glow: rgba(99, 102, 241, 0.5);
+            --text: #e2e8f0;
+            --text-muted: #94a3b8;
+            --success: #22c55e;
+            --danger: #ef4444;
+            --border: rgba(255, 255, 255, 0.08);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: var(--bg);
+            font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            overflow: hidden;
+            height: 100dvh;
+            width: 100vw;
+            position: fixed;
+            inset: 0;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+        }
+
+        #canvas-container {
+            position: fixed;
+            inset: 0;
+            z-index: 1;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        /* ---- 调试骨骼叠加层 ---- */
+        #debug-overlay {
+            position: fixed;
+            bottom: 80px;
+            right: 16px;
+            z-index: 20;
+            width: 200px;
+            height: 150px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            pointer-events: none;
+            transition: opacity 0.3s;
+            opacity: 0;
+        }
+        #debug-overlay.visible {
+            opacity: 1;
+        }
+        #debug-overlay canvas {
+            width: 100%;
+            height: 100%;
+            border-radius: 12px;
+        }
+        #debug-label {
+            position: fixed;
+            bottom: 234px;
+            right: 16px;
+            z-index: 20;
+            font-size: 10px;
+            color: var(--text-muted);
+            letter-spacing: 0.05em;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        #debug-label.visible {
+            opacity: 0.6;
+        }
+
+        @media (max-width: 480px) {
+            #debug-overlay {
+                width: 140px;
+                height: 105px;
+                bottom: 70px;
+                right: 10px;
+            }
+            #debug-label {
+                bottom: 178px;
+                right: 10px;
+                font-size: 9px;
+            }
+        }
+
+        /* ---- Toast ---- */
+        .toast {
+            position: fixed;
+            top: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 100;
+            padding: 10px 20px;
+            border-radius: 12px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border);
+            color: var(--text);
+            font-size: 13px;
+            letter-spacing: 0.02em;
+            transition: opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+            opacity: 0;
+            pointer-events: none;
+            text-align: center;
+            max-width: 90vw;
+        }
+        .toast.show {
+            opacity: 1;
+        }
+
+        /* ---- 控制面板 ---- */
+        .ui-panel {
+            position: fixed;
+            z-index: 10;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 8px;
+            padding: 8px 12px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+        }
+        @media (min-width: 640px) {
+            .ui-panel {
+                bottom: 24px;
+                gap: 10px;
+                padding: 10px 18px;
+                border-radius: 22px;
+            }
+        }
+
+        .btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            padding: 8px 13px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.04);
+            color: var(--text);
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.22s ease;
+            white-space: nowrap;
+            outline: none;
+            letter-spacing: 0.01em;
+            -webkit-tap-highlight-color: transparent;
+            min-height: 40px;
+        }
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.18);
+        }
+        .btn:active {
+            transform: scale(0.95);
+        }
+        .btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+            box-shadow: 0 0 18px var(--accent-glow);
+        }
+        .btn svg {
+            width: 16px;
+            height: 16px;
+            flex-shrink: 0;
+        }
+        .btn-upload {
+            background: rgba(99, 102, 241, 0.15);
+            border-color: rgba(99, 102, 241, 0.3);
+            color: #a5b4fc;
+        }
+        .btn-upload:hover {
+            background: rgba(99, 102, 241, 0.25);
+        }
+        @media (min-width: 640px) {
+            .btn {
+                padding: 10px 16px;
+                font-size: 13px;
+                gap: 6px;
+                border-radius: 14px;
+            }
+            .btn svg {
+                width: 18px;
+                height: 18px;
+            }
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #64748b;
+            flex-shrink: 0;
+            transition: all 0.35s ease;
+        }
+        .status-dot.on {
+            background: var(--success);
+            box-shadow: 0 0 8px rgba(34, 197, 94, 0.6);
+        }
+        .status-dot.off {
+            background: var(--danger);
+        }
+        .status-dot.auto {
+            background: #f59e0b;
+            box-shadow: 0 0 8px rgba(245, 158, 11, 0.5);
+        }
+
+        .particle-count {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 10;
+            color: var(--text-muted);
+            font-size: 10px;
+            letter-spacing: 0.05em;
+            pointer-events: none;
+            opacity: 0.7;
+            font-variant-numeric: tabular-nums;
+        }
+        @media (min-width: 640px) {
+            .particle-count {
+                top: 20px;
+                right: 20px;
+                font-size: 11px;
+            }
+        }
+
+        #image-upload {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+
+    <!-- 调试骨骼标注 -->
+    <div id="debug-label">HAND TRACKING</div>
+    <div id="debug-overlay">
+        <canvas id="debug-canvas" width="200" height="150"></canvas>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
+
+    <!-- 粒子计数 -->
+    <div class="particle-count" id="particle-count">PARTICLES: 10,000</div>
+
+    <!-- 控制面板 -->
+    <div class="ui-panel">
+        <button class="btn btn-upload" id="btn-upload">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/>
+                <path d="M21 15l-5-5L5 21"/>
+            </svg>
+            <span>图片</span>
+        </button>
+        <button class="btn" id="btn-camera">
+            <span class="status-dot off" id="status-dot"></span>
+            <span>手势</span>
+        </button>
+        <button class="btn" id="btn-fullscreen">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" id="fs-expand">
+                <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/>
+            </svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" id="fs-shrink" style="display:none">
+                <path d="M8 3v3a2 2 0 01-2 2H3m18 0h-3a2 2 0 01-2-2V3M3 16h3a2 2 0 012 2v3m8 0v-3a2 2 0 012-2h3"/>
+            </svg>
+        </button>
+        <button class="btn" id="btn-reset">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 019.95 9"/>
+            </svg>
+        </button>
+    </div>
+
+    <input type="file" id="image-upload" accept="image/*">
+
+    <!-- 摄像头视频元素（隐藏但保留尺寸） -->
+    <video id="video-input" playsinline autoplay muted
+    style="position:fixed;top:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;z-index:-1;"></video>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // ==================== DOM ====================
+        const container = document.getElementById('canvas-container');
+        const toast = document.getElementById('toast');
+        const particleCountEl = document.getElementById('particle-count');
+        const btnUpload = document.getElementById('btn-upload');
+        const btnCamera = document.getElementById('btn-camera');
+        const btnFullscreen = document.getElementById('btn-fullscreen');
+        const btnReset = document.getElementById('btn-reset');
+        const statusDot = document.getElementById('status-dot');
+        const fileInput = document.getElementById('image-upload');
+        const videoElement = document.getElementById('video-input');
+        const fsExpand = document.getElementById('fs-expand');
+        const fsShrink = document.getElementById('fs-shrink');
+        const debugOverlay = document.getElementById('debug-overlay');
+        const debugLabel = document.getElementById('debug-label');
+        const debugCanvas = document.getElementById('debug-canvas');
+        const debugCtx = debugCanvas.getContext('2d');
+
+        // ==================== Toast ====================
+        let toastTimer;
+
+        function showToast(msg, duration = 2200) {
+            clearTimeout(toastTimer);
+            toast.textContent = msg;
+            toast.classList.add('show');
+            toastTimer = setTimeout(() => toast.classList.remove('show'), duration);
+        }
+
+        // ==================== 全局状态 ====================
+        const MAX_PARTICLES = 15000;
+        let cameraEnabled = false;
+        let currentDispersion = 0.0;
+        let targetDispersion = 0.0;
+        let handDetected = false;
+        let handsInstance = null;
+        let cameraStream = null;
+        let frameLoopId = null;
+        let latestResults = null; // 存储最新 MediaPipe 结果用于调试绘制
+        let particleCount = MAX_PARTICLES;
+
+        // ==================== THREE.JS ====================
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x05050a, 0.0018);
+        scene.background = new THREE.Color(0x05050a);
+
+        const camera = new THREE.PerspectiveCamera(70,
+            container.clientWidth / container.clientHeight, 0.1, 30);
+        camera.position.set(0, 0.35, 4.8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.2;
+        container.appendChild(renderer.domElement);
+
+        // ==================== Shaders ====================
+        const vertexShader = /* glsl */ `
+            attribute vec3 randomPosition;
+            attribute vec3 color;
+            attribute float size;
+            varying vec3 vColor;
+            varying float vAlpha;
+            uniform float uDispersion;
+            uniform float uTime;
+            uniform float uPointSize;
+            uniform float uPixelRatio;
+
+            void main() {
+                vec3 pos = mix(position, randomPosition, uDispersion);
+                float wave = sin(uTime * 1.8 + position.x * 3.5) * cos(uTime * 1.3 + position.y * 2.7) * 0.025;
+                wave += sin(uTime * 2.5 + position.z * 4.1) * 0.015;
+                pos += wave * (1.0 - uDispersion * 0.6);
+
+                vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                float sizeAttenuation = clamp(3.5 / -mvPosition.z, 0.4, 2.0);
+
+                gl_Position = projectionMatrix * mvPosition;
+                gl_PointSize = uPointSize * uPixelRatio * size * sizeAttenuation;
+                gl_PointSize = clamp(gl_PointSize, 0.5, 40.0);
+
+                vColor = color;
+                vAlpha = 1.0 - uDispersion * 0.25;
+            }
+        `;
+
+        const fragmentShader = /* glsl */ `
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+                float dist = length(gl_PointCoord - vec2(0.5, 0.5));
+                float alpha = 1.0 - smoothstep(0.38, 0.5, dist);
+                float glow = exp(-dist * 4.5) * 0.35;
+                alpha += glow;
+                alpha = clamp(alpha, 0.0, 1.0);
+                if (alpha < 0.02) discard;
+                vec3 finalColor = vColor + glow * 0.3;
+                gl_FragColor = vec4(finalColor, alpha * vAlpha);
+            }
+        `;
+
+        // ==================== 粒子几何体 ====================
+        const geometry = new THREE.BufferGeometry();
+        let targetPositions, randomPositions, colors, sizes;
+
+        function generateSphereParticles(count) {
+            targetPositions = new Float32Array(count * 3);
+            randomPositions = new Float32Array(count * 3);
+            colors = new Float32Array(count * 3);
+            sizes = new Float32Array(count);
+
+            const radius = 1.6;
+            const scatterRadius = 3.5;
+            const phi_golden = Math.PI * (3 - Math.sqrt(5));
+
+            for (let i = 0; i < count; i++) {
+                const y = 1 - (i / (count - 1)) * 2;
+                const radiusAtY = Math.sqrt(1 - y * y);
+                const theta = phi_golden * i;
+                targetPositions[i * 3] = Math.cos(theta) * radiusAtY * radius;
+                targetPositions[i * 3 + 1] = y * radius;
+                targetPositions[i * 3 + 2] = Math.sin(theta) * radiusAtY * radius;
+
+                const tR = Math.random() * Math.PI * 2;
+                const pR = Math.acos(2 * Math.random() - 1);
+                const rR = scatterRadius * (0.6 + Math.random() * 0.4);
+                randomPositions[i * 3] = Math.sin(pR) * Math.cos(tR) * rR;
+                randomPositions[i * 3 + 1] = Math.sin(pR) * Math.sin(tR) * rR;
+                randomPositions[i * 3 + 2] = Math.cos(pR) * rR;
+
+                const col = new THREE.Color().setHSL(
+                    0.58 + Math.random() * 0.22,
+                    0.6 + Math.random() * 0.4,
+                    0.45 + Math.random() * 0.35
+                );
+                colors[i * 3] = col.r;
+                colors[i * 3 + 1] = col.g;
+                colors[i * 3 + 2] = col.b;
+                sizes[i] = 0.6 + Math.random() * 1.6;
+            }
+        }
+
+        function updateGeometry() {
+            for (const key in geometry.attributes) geometry.deleteAttribute(key);
+            geometry.setAttribute('position', new THREE.BufferAttribute(targetPositions, 3));
+            geometry.setAttribute('randomPosition', new THREE.BufferAttribute(randomPositions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+            geometry.setDrawRange(0, targetPositions.length / 3);
+        }
+
+        generateSphereParticles(MAX_PARTICLES);
+        updateGeometry();
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                uDispersion: { value: 0.0 },
+                uTime: { value: 0.0 },
+                uPointSize: { value: 28.0 },
+                uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+            },
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+        });
+
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        // 背景星场
+        const starsGeo = new THREE.BufferGeometry();
+        const starsPos = new Float32Array(600 * 3);
+        for (let i = 0; i < 600; i++) {
+            starsPos[i * 3] = (Math.random() - 0.5) * 12;
+            starsPos[i * 3 + 1] = (Math.random() - 0.5) * 12;
+            starsPos[i * 3 + 2] = (Math.random() - 0.5) * 12;
+        }
+        starsGeo.setAttribute('position', new THREE.BufferAttribute(starsPos, 3));
+        const stars = new THREE.Points(starsGeo, new THREE.PointsMaterial({
+            color: 0x444466,
+            size: 0.015,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            opacity: 0.6,
+        }));
+        scene.add(stars);
+
+        // ==================== 图片转粒子 ====================
+        function processImage(file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onload = () => convertImageToParticles(img);
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function convertImageToParticles(img) {
+            const maxDim = 180;
+            let w = img.width,
+                h = img.height;
+            if (w > maxDim || h > maxDim) {
+                const r = Math.min(maxDim / w, maxDim / h);
+                w = Math.floor(w * r);
+                h = Math.floor(h * r);
+            }
+            const cvs = document.createElement('canvas');
+            cvs.width = w;
+            cvs.height = h;
+            const ctx = cvs.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            const data = ctx.getImageData(0, 0, w, h).data;
+
+            const valid = [];
+            for (let y = 0; y < h; y++)
+                for (let x = 0; x < w; x++) {
+                    const i = (y * w + x) * 4;
+                    if (data[i + 3] > 20) valid.push({ x, y, r: data[i], g: data[i + 1], b: data[i + 2], a: data[
+                            i + 3] });
+                }
+
+            if (!valid.length) { showToast('⚠️ 无有效像素，请用透明底 PNG');
+                return; }
+
+            let sampled = valid;
+            if (valid.length > MAX_PARTICLES) {
+                sampled = [];
+                const step = valid.length / MAX_PARTICLES;
+                for (let i = 0; i < MAX_PARTICLES; i++) sampled.push(valid[Math.floor(i * step)]);
+            } else if (valid.length < MAX_PARTICLES) {
+                sampled = [];
+                const reps = Math.ceil(MAX_PARTICLES / valid.length);
+                for (let r = 0; r < reps; r++) {
+                    for (const p of valid) { sampled.push(p); if (sampled.length >= MAX_PARTICLES) break; }
+                    if (sampled.length >= MAX_PARTICLES) break;
+                }
+            }
+
+            const count = sampled.length;
+            particleCount = count;
+            targetPositions = new Float32Array(count * 3);
+            randomPositions = new Float32Array(count * 3);
+            colors = new Float32Array(count * 3);
+            sizes = new Float32Array(count);
+
+            const scale = 2.8 / Math.max(w, h);
+            const ox = -w * scale / 2;
+            const oy = h * scale / 2;
+            const sr = 3.5;
+
+            for (let i = 0; i < count; i++) {
+                const p = sampled[i];
+                targetPositions[i * 3] = p.x * scale + ox;
+                targetPositions[i * 3 + 1] = -(p.y * scale - oy);
+                targetPositions[i * 3 + 2] = (Math.random() - 0.5) * 0.15;
+
+                const tR = Math.random() * Math.PI * 2;
+                const pR = Math.acos(2 * Math.random() - 1);
+                const rR = sr * (0.6 + Math.random() * 0.4);
+                randomPositions[i * 3] = Math.sin(pR) * Math.cos(tR) * rR;
+                randomPositions[i * 3 + 1] = Math.sin(pR) * Math.sin(tR) * rR;
+                randomPositions[i * 3 + 2] = Math.cos(pR) * rR;
+
+                colors[i * 3] = p.r / 255;
+                colors[i * 3 + 1] = p.g / 255;
+                colors[i * 3 + 2] = p.b / 255;
+                sizes[i] = 0.5 + (p.a / 255) * 2.0;
+            }
+
+            updateGeometry();
+            targetDispersion = 0.0;
+            currentDispersion = 0.0;
+            particleCountEl.textContent = `PARTICLES: ${count.toLocaleString()}`;
+            showToast('✅ 图片已加载');
+        }
+
+        function resetToSphere() {
+            generateSphereParticles(MAX_PARTICLES);
+            updateGeometry();
+            particleCount = MAX_PARTICLES;
+            targetDispersion = 0.5;
+            particleCountEl.textContent = `PARTICLES: ${MAX_PARTICLES.toLocaleString()}`;
+            showToast('🔄 已恢复球体');
+        }
+
+        // ==================== 调试骨骼绘制 ====================
+        // MediaPipe 手部关键点连线定义
+        const HAND_CONNECTIONS = [
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 4], // 拇指
+            [0, 5],
+            [5, 6],
+            [6, 7],
+            [7, 8], // 食指
+            [0, 9],
+            [9, 10],
+            [10, 11],
+            [11, 12], // 中指
+            [0, 13],
+            [13, 14],
+            [14, 15],
+            [15, 16], // 无名指
+            [0, 17],
+            [17, 18],
+            [18, 19],
+            [19, 20], // 小指
+            [5, 9],
+            [9, 13],
+            [13, 17], // 掌心横线
+        ];
+
+        function drawDebugSkeleton() {
+            debugCtx.clearRect(0, 0, debugCanvas.width, debugCanvas.height);
+
+            if (!latestResults || !latestResults.multiHandLandmarks || latestResults.multiHandLandmarks.length === 0) {
+                // 没有手 → 显示提示
+                debugCtx.fillStyle = 'rgba(255,255,255,0.3)';
+                debugCtx.font = '11px monospace';
+                debugCtx.textAlign = 'center';
+                debugCtx.fillText('NO HAND', debugCanvas.width / 2, debugCanvas.height / 2);
+                return;
+            }
+
+            const dw = debugCanvas.width;
+            const dh = debugCanvas.height;
+            const margin = 15;
+
+            for (const landmarks of latestResults.multiHandLandmarks) {
+                // 计算边界
+                let minX = 1,
+                    maxX = 0,
+                    minY = 1,
+                    maxY = 0;
+                for (const lm of landmarks) {
+                    if (lm.x < minX) minX = lm.x;
+                    if (lm.x > maxX) maxX = lm.x;
+                    if (lm.y < minY) minY = lm.y;
+                    if (lm.y > maxY) maxY = lm.y;
+                }
+                const rangeX = maxX - minX || 0.3;
+                const rangeY = maxY - minY || 0.3;
+                const scale = Math.min((dw - margin * 2) / rangeX, (dh - margin * 2) / rangeY);
+                const offX = (dw - rangeX * scale) / 2 - minX * scale;
+                const offY = (dh - rangeY * scale) / 2 - minY * scale;
+
+                // 画连线
+                debugCtx.strokeStyle = 'rgba(99, 200, 255, 0.7)';
+                debugCtx.lineWidth = 1.5;
+                debugCtx.beginPath();
+                for (const [a, b] of HAND_CONNECTIONS) {
+                    debugCtx.moveTo(landmarks[a].x * scale + offX, landmarks[a].y * scale + offY);
+                    debugCtx.lineTo(landmarks[b].x * scale + offX, landmarks[b].y * scale + offY);
+                }
+                debugCtx.stroke();
+
+                // 画关节点
+                for (let i = 0; i < landmarks.length; i++) {
+                    const lm = landmarks[i];
+                    const sx = lm.x * scale + offX;
+                    const sy = lm.y * scale + offY;
+
+                    // 指尖高亮
+                    const isTip = [4, 8, 12, 16, 20].includes(i);
+                    const isThumbIndex = (i === 4 || i === 8); // 用于计算距离的关键点
+
+                    debugCtx.beginPath();
+                    debugCtx.arc(sx, sy, isThumbIndex ? 4 : isTip ? 3 : 2, 0, Math.PI * 2);
+
+                    if (isThumbIndex) {
+                        debugCtx.fillStyle = '#ffd000';
+                        debugCtx.shadowColor = 'rgba(255,208,0,0.8)';
+                        debugCtx.shadowBlur = 6;
+                    } else if (isTip) {
+                        debugCtx.fillStyle = '#ff6b9d';
+                    } else {
+                        debugCtx.fillStyle = 'rgba(255,255,255,0.6)';
+                    }
+                    debugCtx.fill();
+                    debugCtx.shadowBlur = 0;
+                }
+            }
+        }
+
+        function showDebugOverlay() {
+            debugOverlay.classList.add('visible');
+            debugLabel.classList.add('visible');
+        }
+
+        function hideDebugOverlay() {
+            debugOverlay.classList.remove('visible');
+            debugLabel.classList.remove('visible');
+        }
+
+        // ==================== 手势识别（修复版） ====================
+        async function createHandsInstance() {
+            if (handsInstance) return handsInstance;
+
+            console.log('🔧 创建 MediaPipe Hands 实例...');
+            const Hands = window.Hands;
+
+            handsInstance = new Hands({
+                locateFile: (file) => {
+                    const url = `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`;
+                    console.log('  📦 locateFile:', file, '→', url);
+                    return url;
+                },
+            });
+
+            handsInstance.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.5,
+            });
+
+            // 结果回调
+            handsInstance.onResults((results) => {
+                latestResults = results;
+                const hasHands = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+
+                if (!hasHands) {
+                    handDetected = false;
+                    return;
+                }
+
+                handDetected = true;
+                const lm = results.multiHandLandmarks;
+
+                if (lm.length === 1) {
+                    // 单手：拇指(4) ←→ 食指(8) 距离
+                    const d = Math.hypot(
+                        lm[0][4].x - lm[0][8].x,
+                        lm[0][4].y - lm[0][8].y,
+                        lm[0][4].z - lm[0][8].z
+                    );
+                    // 映射范围
+                    targetDispersion = Math.max(0, Math.min(1, (d - 0.025) / (0.22 - 0.025)));
+                } else {
+                    // 双手：掌心距离
+                    const c1 = avgLandmark(lm[0]);
+                    const c2 = avgLandmark(lm[1]);
+                    const d = Math.hypot(c1.x - c2.x, c1.y - c2.y, c1.z - c2.z);
+                    targetDispersion = Math.max(0, Math.min(1, (d - 0.08) / (0.55 - 0.08)));
+                }
+            });
+
+            // 等待 WASM 模型就绪
+            console.log('⏳ 等待 MediaPipe 模型加载...');
+            await handsInstance.initialize();
+            console.log('✅ MediaPipe Hands 模型加载完成');
+            return handsInstance;
+        }
+
+        function avgLandmark(landmarks) {
+            let cx = 0,
+                cy = 0,
+                cz = 0;
+            for (const lm of landmarks) { cx += lm.x;
+                cy += lm.y;
+                cz += lm.z; }
+            const n = landmarks.length;
+            return { x: cx / n, y: cy / n, z: cz / n };
+        }
+
+        async function startCamera() {
+            if (cameraEnabled) stopCamera();
+            await sleep(400);
+
+            try {
+                // 1. 获取摄像头
+                console.log('📷 请求摄像头权限...');
+                cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'user',
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                    },
+                });
+                console.log('✅ 摄像头流获取成功');
+
+                videoElement.srcObject = cameraStream;
+                await videoElement.play();
+                console.log('✅ 视频播放中, readyState:', videoElement.readyState);
+
+                // 等待视频就绪
+                if (videoElement.readyState < 2) {
+                    await new Promise((resolve, reject) => {
+                        const timeout = setTimeout(() => reject(new Error('视频加载超时')), 6000);
+                        videoElement.onloadeddata = () => { clearTimeout(timeout);
+                            resolve(); };
+                    });
+                    console.log('✅ 视频数据就绪');
+                }
+
+                // 2. 初始化 MediaPipe
+                const hands = await createHandsInstance();
+
+                // 3. 手动 RAF 帧循环（核心：不用 camera_utils）
+                console.log('🔄 启动手势识别帧循环...');
+                let frameCount = 0;
+                const processFrame = async () => {
+                    if (!cameraEnabled) return;
+                    try {
+                        if (videoElement.readyState >= 2) {
+                            await hands.send({ image: videoElement });
+                            frameCount++;
+                            // 每 60 帧打印一次确认存活
+                            if (frameCount % 60 === 0) {
+                                const hasHand = latestResults?.multiHandLandmarks?.length > 0;
+                                console.log(`  📊 帧#${frameCount} | 检测到手: ${hasHand ? 'YES' : 'NO'} | dispersion: ${targetDispersion.toFixed(3)}`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('MediaPipe send 异常:', e);
+                    }
+                    frameLoopId = requestAnimationFrame(processFrame);
+                };
+                processFrame();
+
+                // 4. 更新 UI
+                cameraEnabled = true;
+                statusDot.className = 'status-dot on';
+                btnCamera.classList.add('active');
+                showDebugOverlay(); // 显示骨骼调试面板
+                showToast('👌 手势识别已激活 — 捏合聚集 · 张开扩散');
+                console.log('✅ 摄像头系统完全就绪');
+
+            } catch (err) {
+                console.error('❌ 摄像头启动失败:', err);
+                cameraEnabled = false;
+                cameraStream = null;
+                hideDebugOverlay();
+                statusDot.className = 'status-dot off';
+                btnCamera.classList.remove('active');
+
+                const msgs = {
+                    NotAllowedError: '❌ 摄像头权限被拒绝，请在浏览器设置中允许',
+                    NotFoundError: '❌ 未找到摄像头设备',
+                    NotReadableError: '❌ 摄像头被其他应用占用',
+                };
+                showToast(msgs[err.name] || `❌ 摄像头不可用: ${err.message}`, 3500);
+            }
+        }
+
+        function stopCamera() {
+            console.log('🛑 停止摄像头...');
+            cameraEnabled = false;
+            if (frameLoopId) { cancelAnimationFrame(frameLoopId);
+                frameLoopId = null; }
+            if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop());
+                cameraStream = null; }
+            videoElement.srcObject = null;
+            handDetected = false;
+            latestResults = null;
+            hideDebugOverlay();
+            statusDot.className = 'status-dot off';
+            btnCamera.classList.remove('active');
+            showToast('📷 摄像头已关闭');
+        }
+
+        async function toggleCamera() {
+            if (cameraEnabled) {
+                stopCamera();
+            } else {
+                btnCamera.disabled = true;
+                btnCamera.style.opacity = '0.6';
+                statusDot.className = 'status-dot auto';
+                showToast('⏳ 正在启动摄像头...');
+                try {
+                    await startCamera();
+                } finally {
+                    btnCamera.disabled = false;
+                    btnCamera.style.opacity = '1';
+                }
+            }
+        }
+
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        // ==================== 全屏 ====================
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                (document.body.requestFullscreen || document.documentElement.requestFullscreen)
+                .call(document.body).catch(() => {});
+            } else {
+                document.exitFullscreen();
+            }
+        }
+
+        function updateFS() {
+            const fs = !!document.fullscreenElement;
+            fsExpand.style.display = fs ? 'none' : 'block';
+            fsShrink.style.display = fs ? 'block' : 'none';
+        }
+        document.addEventListener('fullscreenchange', updateFS);
+        document.addEventListener('webkitfullscreenchange', updateFS);
+
+        // ==================== 动画循环 ====================
+        const clock = new THREE.Clock();
+        let autoBreathTime = 0;
+        let debugDrawCounter = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = Math.min(clock.getDelta(), 0.1);
+            const elapsed = performance.now() * 0.001;
+
+            // 自动呼吸模式
+            if (!handDetected && !cameraEnabled) {
+                autoBreathTime += delta * 0.7;
+                targetDispersion = Math.sin(autoBreathTime) * 0.5 + 0.5;
+                statusDot.className = 'status-dot auto';
+            } else if (!handDetected && cameraEnabled) {
+                targetDispersion = Math.max(0, targetDispersion - delta * 0.8);
+                statusDot.className = 'status-dot on';
+            }
+
+            // Lerp
+            currentDispersion += (targetDispersion - currentDispersion) * 4.5 * delta;
+            material.uniforms.uDispersion.value = currentDispersion;
+            material.uniforms.uTime.value = elapsed;
+
+            // 旋转
+            const rs = 0.15 + currentDispersion * 0.3;
+            points.rotation.y += rs * delta;
+            points.rotation.x += rs * 0.35 * delta;
+            stars.rotation.y -= rs * 0.4 * delta;
+
+            camera.position.y = 0.35 + Math.sin(elapsed * 0.4) * 0.12;
+            camera.lookAt(0, 0, 0);
+
+            renderer.render(scene, camera);
+
+            // 定期更新调试骨骼画布（每3帧一次足够）
+            debugDrawCounter++;
+            if (debugDrawCounter % 3 === 0 && cameraEnabled) {
+                drawDebugSkeleton();
+            }
+        }
+
+        // ==================== 事件 ====================
+        btnUpload.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files[0]) processImage(e.target.files[0]);
+            fileInput.value = '';
+        });
+        btnCamera.addEventListener('click', toggleCamera);
+        btnFullscreen.addEventListener('click', toggleFullscreen);
+        btnReset.addEventListener('click', resetToSphere);
+        renderer.domElement.addEventListener('dblclick', toggleFullscreen);
+
+        document.addEventListener('dragover', e => { e.preventDefault(); });
+        document.addEventListener('drop', e => {
+            e.preventDefault();
+            const f = e.dataTransfer?.files?.[0];
+            if (f?.type?.startsWith('image/')) processImage(f);
+        });
+
+        window.addEventListener('keydown', e => {
+            switch (e.key.toLowerCase()) {
+                case 'f':
+                    toggleFullscreen();
+                    break;
+                case 'c':
+                    toggleCamera();
+                    break;
+                case 'r':
+                    resetToSphere();
+                    break;
+                case 'u':
+                    fileInput.click();
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            material.uniforms.uPixelRatio.value = Math.min(window.devicePixelRatio, 2);
+        });
+
+        // ==================== 启动 ====================
+        particleCountEl.textContent = `PARTICLES: ${MAX_PARTICLES.toLocaleString()}`;
+        animate();
+
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('🚀 3D 粒子系统 v2 已就绪');
+        console.log('   📷 C / 手势按钮 → 开启摄像头');
+        console.log('   🖼️ U / 图片按钮 → 上传图片');
+        console.log('   🔲 F / 双击画面 → 全屏');
+        console.log('   🔄 R → 重置球体');
+        console.log('   🦴 摄像头开启后右下角显示骨骼标注');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    </script>
+</body>
+</html>
