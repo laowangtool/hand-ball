@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>手指控制图标</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box;}
+        body{
+            background:#000;overflow:hidden;
+            height:100dvh;width:100vw;
+            font-family:'PingFang SC','Microsoft YaHei',sans-serif;
+            user-select:none;-webkit-user-select:none;
+            -webkit-tap-highlight-color:transparent;
+            touch-action:manipulation;
+        }
+
+        /* 第1层：摄像头（不透明） */
+        #cam-video{
+            position:fixed;inset:0;width:100%;height:100%;
+            object-fit:cover;z-index:1;
+            /* transform 由 JS 动态控制 */
+        }
+
+        /* 第2层：图标 */
+        #icons-layer{
+            position:fixed;inset:0;z-index:2;
+            pointer-events:none;
+        }
+        .icon-item{
+            position:absolute;
+            font-size:44px;
+            transition:none;
+            will-change:transform;
+            line-height:1;
+            filter:drop-shadow(0 0 10px rgba(255,255,255,0.7))
+                   drop-shadow(0 2px 4px rgba(0,0,0,0.4));
+        }
+        @media(min-width:640px){
+            .icon-item{font-size:56px;}
+        }
+
+        /* 第3层：骨骼标注 */
+        #sk-canvas{
+            position:fixed;inset:0;z-index:10;
+            pointer-events:none;
+        }
+
+        /* 底部按钮栏 */
+        .btn-bar{
+            position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+            z-index:30;display:flex;gap:10px;
+        }
+        .btn{
+            padding:10px 18px;border-radius:22px;
+            border:1px solid rgba(255,255,255,0.25);
+            background:rgba(0,0,0,0.65);
+            backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+            color:#fff;font-size:13px;cursor:pointer;
+            font-weight:500;letter-spacing:0.02em;
+            transition:all 0.2s;
+        }
+        .btn:active{transform:scale(0.93);}
+        .btn.on{
+            border-color:#22c55e;
+            box-shadow:0 0 14px rgba(34,197,94,0.35);
+        }
+
+        /* 诊断角标 */
+        #diag{
+            position:fixed;top:8px;left:8px;z-index:30;
+            background:rgba(0,0,0,0.75);color:#0f0;
+            font-size:9px;padding:4px 8px;border-radius:5px;
+            border:1px solid #333;line-height:1.5;
+            pointer-events:none;font-family:monospace;
+            white-space:pre-wrap;
+        }
+    </style>
+</head>
+<body>
+
+    <video id="cam-video" playsinline autoplay muted></video>
+    <div id="icons-layer"></div>
+    <canvas id="sk-canvas"></canvas>
+
+    <div id="diag"></div>
+
+    <div class="btn-bar">
+        <button class="btn on" id="btn-front">📱 前置</button>
+        <button class="btn" id="btn-back">📷 后置</button>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+    (function(){
+        // ===== DOM =====
+        const videoEl   = document.getElementById('cam-video');
+        const iconsLayer= document.getElementById('icons-layer');
+        const skCanvas  = document.getElementById('sk-canvas');
+        const skCtx     = skCanvas.getContext('2d');
+        const diag      = document.getElementById('diag');
+        const btnFront  = document.getElementById('btn-front');
+        const btnBack   = document.getElementById('btn-back');
+
+        // ===== 状态 =====
+        let hands=null, rafId=null, stream=null;
+        let sendCount=0, sending=false;
+        let latestLM=null;
+        let facingMode='user';
+        let fingerPos=null;
+
+        const offC=document.createElement('canvas');
+        offC.width=640;offC.height=480;
+        const offCtx=offC.getContext('2d',{willReadFrequently:true});
+
+        function diagMsg(msg){diag.textContent=msg;console.log(msg);}
+
+        // ===== 图标系统 =====
+        const emojis=['⭐','🟢','🔵','🟣','💎','🔥','🌟','✨','🦋','🌸','🍀','💫','🎯','🔮','🫧'];
+        const icons=[];
+        const ICON_COUNT=8;
+
+        class IconObj{
+            constructor(emoji){
+                this.el=document.createElement('div');
+                this.el.className='icon-item';
+                this.el.textContent=emoji;
+                iconsLayer.appendChild(this.el);
+
+                this.x=Math.random()*(window.innerWidth-60)+30;
+                this.y=Math.random()*(window.innerHeight-60)+30;
+                this.homeX=this.x;
+                this.homeY=this.y;
+                this.vx=0;this.vy=0;
+
+                const s=32+Math.random()*22;
+                this.baseSize=s;
+                this.el.style.fontSize=s+'px';
+                this.updateDOM();
+            }
+
+            updateDOM(){
+                this.el.style.transform=`translate(${this.x}px,${this.y}px)`;
+            }
+
+            update(dt,fx,fy){
+                const dtC=Math.min(dt,0.05);
+                if(fx!==null&&fy!==null){
+                    const dx=this.x-fx,dy=this.y-fy;
+                    const dist=Math.sqrt(dx*dx+dy*dy);
+                    const pushR=130,pushS=550;
+                    if(dist<pushR&&dist>0.1){
+                        const f=pushS*(1-dist/pushR)/dist;
+                        this.vx+=dx*f*dtC;
+                        this.vy+=dy*f*dtC;
+                        this.el.style.fontSize=this.baseSize*(1+(1-dist/pushR)*0.7)+'px';
+                    }
+                }
+                // 弹簧回归
+                this.vx+=(this.homeX-this.x)*3.5*dtC;
+                this.vy+=(this.homeY-this.y)*3.5*dtC;
+                this.vx*=0.84;this.vy*=0.84;
+                this.x+=this.vx*dtC;this.y+=this.vy*dtC;
+                // 边界
+                const m=15;
+                if(this.x<m){this.x=m;this.vx*=-0.3;}
+                if(this.x>window.innerWidth-m){this.x=window.innerWidth-m;this.vx*=-0.3;}
+                if(this.y<m){this.y=m;this.vy*=-0.3;}
+                if(this.y>window.innerHeight-m){this.y=window.innerHeight-m;this.vy*=-0.3;}
+                this.updateDOM();
+            }
+
+            resetHome(){
+                this.homeX=Math.random()*(window.innerWidth-60)+30;
+                this.homeY=Math.random()*(window.innerHeight-60)+30;
+            }
+        }
+
+        function spawnIcons(){
+            iconsLayer.innerHTML='';
+            icons.length=0;
+            const shuffled=[...emojis].sort(()=>Math.random()-0.5);
+            for(let i=0;i<ICON_COUNT;i++){
+                icons.push(new IconObj(shuffled[i%shuffled.length]));
+            }
+        }
+
+        // ===== 骨骼绘制 =====
+        const CONNS=[
+            [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+            [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+            [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]
+        ];
+
+        function drawBones(lmList){
+            skCanvas.width=window.innerWidth;
+            skCanvas.height=window.innerHeight;
+            skCtx.clearRect(0,0,skCanvas.width,skCanvas.height);
+            if(!lmList||lmList.length===0)return;
+
+            const W=skCanvas.width,H=skCanvas.height;
+            // 前置镜像骨骼，后置不镜像
+            const mirror=facingMode==='user';
+
+            for(const lm of lmList){
+                // 连线
+                skCtx.strokeStyle='#0ff';skCtx.lineWidth=4;
+                skCtx.lineCap='round';skCtx.lineJoin='round';
+                skCtx.shadowColor='rgba(0,255,255,0.6)';skCtx.shadowBlur=6;
+                skCtx.beginPath();
+                for(const[a,b] of CONNS){
+                    const ax=mirror?(1-lm[a].x)*W:lm[a].x*W;
+                    const ay=lm[a].y*H;
+                    const bx=mirror?(1-lm[b].x)*W:lm[b].x*W;
+                    const by=lm[b].y*H;
+                    skCtx.moveTo(ax,ay);skCtx.lineTo(bx,by);
+                }
+                skCtx.stroke();skCtx.shadowBlur=0;
+
+                // 关节点
+                for(let i=0;i<lm.length;i++){
+                    const p=lm[i];
+                    const sx=mirror?(1-p.x)*W:p.x*W;
+                    const sy=p.y*H;
+                    const r=(i===4||i===8)?8:(i===12||i===16||i===20)?5:3;
+                    // 光晕
+                    skCtx.beginPath();skCtx.arc(sx,sy,r+4,0,Math.PI*2);
+                    skCtx.fillStyle='rgba(255,255,0,0.25)';skCtx.fill();
+                    // 实体
+                    skCtx.beginPath();skCtx.arc(sx,sy,r,0,Math.PI*2);
+                    skCtx.fillStyle=(i===4||i===8)?'#ff0':(i===12||i===16||i===20)?'#f6a':'#fff';
+                    skCtx.fill();
+                }
+            }
+        }
+
+        // ===== MediaPipe =====
+        async function initHands(){
+            if(hands)return hands;
+            const H=window.Hands;
+            if(!H){diagMsg('❌ window.Hands 不存在');return null;}
+            hands=new H({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${f}`});
+            hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.5,minTrackingConfidence:0.3});
+            hands.onResults(r=>{
+                const lm=r.multiHandLandmarks;
+                if(lm&&lm.length>0){
+                    latestLM=lm;
+                    drawBones(lm);
+                    const mirror=facingMode==='user';
+                    const idx=lm[0][8];
+                    fingerPos={
+                        x:mirror?(1-idx.x)*window.innerWidth:idx.x*window.innerWidth,
+                        y:idx.y*window.innerHeight
+                    };
+                }else{
+                    latestLM=null;
+                    fingerPos=null;
+                    skCtx.clearRect(0,0,skCanvas.width,skCanvas.height);
+                }
+            });
+            await hands.initialize();
+            return hands;
+        }
+
+        // ===== 摄像头 =====
+        async function startCam(){
+            if(stream){stopCam();await sleep(300);}
+            try{
+                stream=await navigator.mediaDevices.getUserMedia({video:{facingMode,width:640,height:480}});
+                videoEl.srcObject=stream;
+
+                // 镜像：前置镜像，后置不镜像
+                videoEl.style.transform = facingMode==='user' ? 'scaleX(-1)' : 'none';
+
+                await videoEl.play();
+                if(videoEl.readyState<2){
+                    await new Promise((res,rej)=>{
+                        const t=setTimeout(()=>rej(new Error('视频超时')),8000);
+                        videoEl.onloadeddata=()=>{clearTimeout(t);res();};
+                    });
+                }
+
+                const h=await initHands();
+                if(!h){diagMsg('❌ 模型加载失败');return;}
+
+                async function frame(){
+                    rafId=requestAnimationFrame(frame);
+                    if(sending)return;sending=true;
+                    try{if(videoEl.readyState>=2&&videoEl.videoWidth>0){offCtx.drawImage(videoEl,0,0,640,480);await h.send({image:offC});sendCount++;}}catch(e){}
+                    sending=false;
+                }
+                frame();
+
+                // 更新按钮状态
+                btnFront.className='btn'+(facingMode==='user'?' on':'');
+                btnBack.className='btn'+(facingMode==='environment'?' on':'');
+
+                diagMsg('✅ 运行中');
+            }catch(e){diagMsg('❌ '+e.message);}
+        }
+
+        function stopCam(){
+            if(rafId){cancelAnimationFrame(rafId);rafId=null;}
+            if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+            videoEl.srcObject=null;
+            latestLM=null;fingerPos=null;
+            skCtx.clearRect(0,0,skCanvas.width,skCanvas.height);
+            diagMsg('⏸ 已停止');
+        }
+
+        async function switchCam(mode){
+            if(facingMode===mode)return;
+            facingMode=mode;
+            stopCam();
+            await sleep(300);
+            await startCam();
+        }
+
+        function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+
+        btnFront.addEventListener('click',()=>switchCam('user'));
+        btnBack.addEventListener('click',()=>switchCam('environment'));
+
+        // ===== 动画循环 =====
+        let lastTime=performance.now();
+        function animate(now){
+            requestAnimationFrame(animate);
+            const dt=(now-lastTime)/1000;
+            lastTime=now;
+
+            const fx=fingerPos?fingerPos.x:null;
+            const fy=fingerPos?fingerPos.y:null;
+            for(const icon of icons) icon.update(dt,fx,fy);
+        }
+
+        // ===== 启动 =====
+        spawnIcons();
+        startCam();
+        requestAnimationFrame(animate);
+
+        window.addEventListener('resize',()=>{
+            for(const icon of icons) icon.resetHome();
+        });
+    })();
+    </script>
+</body>
+</html>
